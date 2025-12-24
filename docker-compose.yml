@@ -1,0 +1,32 @@
+services:
+  mqtt-cec:
+    build: .
+    container_name: mqtt_cec_controller
+
+    # Restart policy: unless-stopped
+    # - Restarts on crash/failure
+    # - Restarts on system reboot
+    # - Does NOT restart if explicitly stopped by user
+    restart: unless-stopped
+
+    # HDMI-CEC requires access to /dev/vchiq (Raspberry Pi)
+    devices:
+      - "/dev/vchiq:/dev/vchiq"
+
+    # Grant privileged access for CEC device control
+    privileged: true
+
+    # Environment variables from .env file
+    env_file:
+      - .env
+
+    # Mount source code as volume for live editing
+    volumes:
+      - ./src:/app/src
+
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
