@@ -19,7 +19,10 @@ class Config:
     mqtt_availability_offline: str = "Offline"
     mqtt_client_id: str = "mqtt_cec_controller"
     mqtt_qos: int = 1
-    cec_device: int = 1
+    cec_adapter: str = "/dev/cec0"
+    cec_osd_name: str = "Raspberry Pi"
+    cec_poll_interval: int = 30
+    cec_remote_keys: bool = True
     log_level: str = "INFO"
 
     @property
@@ -31,6 +34,11 @@ class Config:
     def mqtt_input_command_topic(self) -> str:
         """Get the command topic for receiving input switch commands."""
         return f"cmnd/{self.mqtt_device_name}/INPUT"
+
+    @property
+    def mqtt_stat_topic_prefix(self) -> str:
+        """Get the prefix for per-command status topics (stat/{device}/POWER, ...)."""
+        return f"stat/{self.mqtt_device_name}"
 
     @property
     def mqtt_state_topic(self) -> str:
@@ -64,6 +72,11 @@ def load_config() -> Config:
         print("WARNING: MQTT_TOPIC is deprecated. Please use MQTT_DEVICE_NAME instead.", file=sys.stderr)
         print("         Example: MQTT_DEVICE_NAME=tv (creates topics like cmnd/tv/POWER)", file=sys.stderr)
 
+    # CEC_DEVICE was passed to cec-client's -d flag, which is its log level
+    if os.getenv("CEC_DEVICE"):
+        print("WARNING: CEC_DEVICE is deprecated and ignored. Use CEC_ADAPTER (default /dev/cec0).",
+              file=sys.stderr)
+
     return Config(
         mqtt_broker_host=mqtt_host,
         mqtt_broker_port=int(os.getenv("MQTT_BROKER_PORT", "1883")),
@@ -75,6 +88,9 @@ def load_config() -> Config:
         mqtt_availability_offline=os.getenv("MQTT_AVAILABILITY_OFFLINE", "Offline"),
         mqtt_client_id=os.getenv("MQTT_CLIENT_ID", "mqtt_cec_controller"),
         mqtt_qos=int(os.getenv("MQTT_QOS", "1")),
-        cec_device=int(os.getenv("CEC_DEVICE", "1")),
+        cec_adapter=os.getenv("CEC_ADAPTER", "/dev/cec0"),
+        cec_osd_name=os.getenv("CEC_OSD_NAME", "Raspberry Pi"),
+        cec_poll_interval=int(os.getenv("CEC_POLL_INTERVAL", "30")),
+        cec_remote_keys=os.getenv("CEC_REMOTE_KEYS", "true").lower() in ("1", "true", "yes", "on"),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper()
     )

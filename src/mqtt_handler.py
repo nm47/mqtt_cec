@@ -1,4 +1,4 @@
-"""MQTT client handler for receiving power commands."""
+"""MQTT client handler for receiving TV commands and publishing TV state."""
 
 import json
 import logging
@@ -7,9 +7,17 @@ from datetime import datetime
 import paho.mqtt.client as mqtt
 from typing import TYPE_CHECKING
 
+from .cec_controller import HDMI_PHYSICAL_ADDRESSES
+
 if TYPE_CHECKING:
     from .config import Config
     from .cec_controller import CECController
+
+
+# Tasmota-compatible POWER payloads
+POWER_ON_PAYLOADS = {"ON", "1", "TRUE"}
+POWER_OFF_PAYLOADS = {"OFF", "0", "FALSE"}
+POWER_TOGGLE_PAYLOADS = {"TOGGLE", "2"}
 
 
 class MQTTHandler:
@@ -27,12 +35,11 @@ class MQTTHandler:
         self.cec = cec_controller
         self.client = None
         self.logger = logging.getLogger(__name__)
-        self.current_power_state: str = "UNKNOWN"
-        self.current_input: str = "UNKNOWN"
+        self.start_time: float = time.time()
         self.last_state_publish_time: float = 0.0
 
     def connect(self) -> None:
-        """Initialize and connect MQTT client."""
+        """Initialize MQTT client and start connecting in the background."""
         self.client = mqtt.Client(client_id=self.config.mqtt_client_id)
 
         # Authentication if credentials provided
@@ -55,13 +62,15 @@ class MQTTHandler:
         self.client.on_disconnect = self._on_disconnect
         self.client.on_message = self._on_message
 
-        # Connect with automatic reconnection
         self.logger.info(
             f"Connecting to MQTT broker at "
             f"{self.config.mqtt_broker_host}:{self.config.mqtt_broker_port}"
         )
 
-        self.client.connect(
+        # Connect asynchronously so an unreachable broker at startup is
+        # retried by the network loop instead of crashing the service
+        self.client.reconnect_delay_set(min_delay=1, max_delay=60)
+        self.client.connect_async(
             self.config.mqtt_broker_host,
             self.config.mqtt_broker_port,
             keepalive=60
@@ -84,10 +93,7 @@ class MQTTHandler:
 
             # Publish online status
             self.publish_availability_online()
-
-            # Publish initial state (will be implemented in publish methods)
-            # Note: uptime will be 0 on initial connect, actual uptime added from main loop
-            self.publish_state(0)
+            self.publish_state()
         else:
             self.logger.error(f"Connection failed with code {rc}")
 
@@ -109,6 +115,11 @@ class MQTTHandler:
                 f"Received message on {msg.topic}: {payload}"
             )
 
+            # A retained command would re-run on every reconnect
+            if msg.retain:
+                self.logger.warning(f"Ignoring retained command on {msg.topic}")
+                return
+
             # Route to appropriate handler based on topic
             if msg.topic == self.config.mqtt_command_topic:
                 self._handle_power_command(payload)
@@ -125,45 +136,52 @@ class MQTTHandler:
         Handle POWER command.
 
         Args:
-            payload: Command payload (ON/OFF)
+            payload: ON/OFF/TOGGLE (or 1/0/2), empty to query
         """
-        success = False
-        if payload == "ON":
-            success = self.cec.power_on()
-            if success:
-                self.current_power_state = "ON"
-        elif payload == "OFF":
-            success = self.cec.power_off()
-            if success:
-                self.current_power_state = "OFF"
-        else:
+        if payload in POWER_TOGGLE_PAYLOADS:
+            self.cec.toggle_power()
+        elif payload in POWER_ON_PAYLOADS:
+            self.cec.power_on()
+        elif payload in POWER_OFF_PAYLOADS:
+            self.cec.power_off()
+        elif payload:
             self.logger.warning(f"Unknown power payload: {payload}")
+            return
 
-        # Publish state immediately after successful command
-        if success:
-            self.publish_state(0)
+        self._publish_result("POWER", self.cec.power)
 
     def _handle_input_command(self, payload: str) -> None:
         """
         Handle INPUT command.
 
         Args:
-            payload: Command payload (HDMI1/HDMI2/HDMI3/HDMI4)
+            payload: HDMI1/HDMI2/HDMI3/HDMI4, empty to query
         """
-        # Validate payload format
-        valid_inputs = ["HDMI1", "HDMI2", "HDMI3", "HDMI4"]
-        if payload not in valid_inputs:
-            self.logger.warning(
-                f"Invalid input payload: {payload}. "
-                f"Valid values: {', '.join(valid_inputs)}"
-            )
-            return
+        if payload:
+            if payload not in HDMI_PHYSICAL_ADDRESSES:
+                self.logger.warning(
+                    f"Invalid input payload: {payload}. "
+                    f"Valid values: {', '.join(HDMI_PHYSICAL_ADDRESSES)}"
+                )
+                return
+            self.cec.switch_input(payload)
 
-        success = self.cec.switch_input(payload)
-        if success:
-            self.current_input = payload
-            # Publish state immediately after successful command
-            self.publish_state(0)
+        self._publish_result("INPUT", self.cec.input)
+
+    def on_state_change(self, power: str, input: str) -> None:
+        """Publish TV state whenever it changes, whatever caused the change."""
+        self._publish(f"{self.config.mqtt_stat_topic_prefix}/POWER", power)
+        self._publish(f"{self.config.mqtt_stat_topic_prefix}/INPUT", input)
+        self.publish_state()
+
+    def _publish_result(self, key: str, value: str) -> None:
+        """Answer a command Tasmota-style on stat/{device}/RESULT."""
+        self._publish(f"{self.config.mqtt_stat_topic_prefix}/RESULT", json.dumps({key: value}))
+        self._publish(f"{self.config.mqtt_stat_topic_prefix}/{key}", value)
+
+    def _publish(self, topic: str, payload: str) -> None:
+        if self.client:
+            self.client.publish(topic=topic, payload=payload, qos=self.config.mqtt_qos, retain=False)
 
     def publish_availability_online(self) -> None:
         """Publish Online status to LWT topic."""
@@ -176,17 +194,13 @@ class MQTTHandler:
             )
             self.logger.info(f"Published availability: {self.config.mqtt_availability_online}")
 
-    def publish_state(self, uptime_seconds: int) -> None:
-        """
-        Publish current state as JSON telemetry.
-
-        Args:
-            uptime_seconds: Service uptime in seconds
-        """
+    def publish_state(self) -> None:
+        """Publish current state as JSON telemetry."""
         if not self.client:
             return
 
         # Calculate uptime in DDThh:mm:ss format
+        uptime_seconds = int(time.time() - self.start_time)
         days = uptime_seconds // 86400
         hours = (uptime_seconds % 86400) // 3600
         minutes = (uptime_seconds % 3600) // 60
@@ -195,10 +209,10 @@ class MQTTHandler:
 
         # Build Tasmota-compatible state payload
         state_payload = {
-            "Time": datetime.now().isoformat(),
+            "Time": datetime.now().isoformat(timespec="seconds"),
             "Uptime": uptime_str,
-            "POWER": self.current_power_state,
-            "INPUT": self.current_input
+            "POWER": self.cec.power,
+            "INPUT": self.cec.input
         }
 
         try:
@@ -228,5 +242,15 @@ class MQTTHandler:
         """Gracefully disconnect from MQTT broker."""
         if self.client:
             self.logger.info("Disconnecting from MQTT broker")
-            self.client.loop_stop()
+            # Clean disconnects don't trigger the LWT, so mark offline ourselves
+            try:
+                self.client.publish(
+                    topic=self.config.mqtt_lwt_topic,
+                    payload=self.config.mqtt_availability_offline,
+                    qos=self.config.mqtt_qos,
+                    retain=True
+                ).wait_for_publish(timeout=2)
+            except (RuntimeError, ValueError) as e:
+                self.logger.warning(f"Could not publish offline status: {e}")
             self.client.disconnect()
+            self.client.loop_stop()

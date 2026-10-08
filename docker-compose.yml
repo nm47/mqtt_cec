@@ -9,12 +9,9 @@ services:
     # - Does NOT restart if explicitly stopped by user
     restart: unless-stopped
 
-    # HDMI-CEC requires access to /dev/vchiq (Raspberry Pi)
+    # Kernel HDMI-CEC adapter (vc4-hdmi on a Raspberry Pi with KMS)
     devices:
-      - "/dev/vchiq:/dev/vchiq"
-
-    # Grant privileged access for CEC device control
-    privileged: true
+      - "/dev/cec0:/dev/cec0"
 
     # Environment variables from .env file
     env_file:
